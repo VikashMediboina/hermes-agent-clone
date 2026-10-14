@@ -282,6 +282,8 @@ flowchart TD
 
 ## 4A. Deep dive: the agent loop and tool calls
 
+Worked traces with many tool calls, plan → validate → execute, several sub-agents and error recovery: [AGENT_LOOP_EXAMPLES.md](AGENT_LOOP_EXAMPLES.md).
+
 Traced from `agent/conversation_loop.py`, `agent/turn_tool_round.py`, `agent/tool_executor.py`, `run_agent.py`, `model_tools.py`, `tools/registry.py` and `agent/transports/base.py`.
 
 ### 4A.1 The core idea in 4 lines
