@@ -143,6 +143,8 @@ flowchart TD
   L --> M(["return final_response + messages"])
 ```
 
+For the full walkthrough of the loop and tool calls, see [§4A](#4a-deep-dive-the-agent-loop-and-tool-calls).
+
 ### 4.2 Tools: `tools/`, `model_tools.py`, `toolsets.py`
 - Each tool module calls `registry.register(...)` at import time (`tools/registry.py`). `discover_builtin_tools()` finds these modules by scanning their syntax trees.
 - `toolsets.py` defines `TOOLSETS`, named groups like `web`, `terminal`, `file`, `browser`, `coding`, `hermes-telegram`. Groups can include other groups. `_HERMES_CORE_TOOLS` is the default core list.
@@ -275,6 +277,224 @@ flowchart TD
   C2 -- summary only --> P
   C3 -- summary later --> P
 ```
+
+---
+
+## 4A. Deep dive: the agent loop and tool calls
+
+Traced from `agent/conversation_loop.py`, `agent/turn_tool_round.py`, `agent/tool_executor.py`, `run_agent.py`, `model_tools.py`, `tools/registry.py` and `agent/transports/base.py`.
+
+### 4A.1 The core idea in 4 lines
+```
+messages = [system, ...history, user]
+loop:
+    reply = LLM(messages, tools)              # one "API call"
+    if reply has tool_calls: run them, append results, loop again
+    else: reply text is the final answer → stop
+```
+Everything else in the code is safety around this loop: budgets, retries, compression, caching, approvals, persistence and interrupts.
+
+---
+
+### 4A.2 Who calls the loop
+Every front-end ends up making the same call:
+```python
+result = agent.run_conversation(user_message, conversation_history=history)
+# → {"final_response": "...", "messages": [...full updated transcript...]}
+```
+- **CLI** `cli.py` · **gateway** `gateway/run_turn_runner.py` · **TUI** `tui_gateway/methods_*.py` · **cron** `cron/scheduler.py::run_job` · **sub-agents** `tools/delegate_tool.py`
+- `AIAgent.run_conversation` (`agent/turn_facade.py`) first takes a **session turn lease**, so no two processes run the same session at once, and starts a **liveness watchdog**. Then it calls `agent/conversation_loop.py::run_conversation` → `_run_conversation_turn`.
+
+---
+
+### 4A.3 The real loop (`agent/conversation_loop.py:_run_conversation_turn`, ~line 1547)
+
+```mermaid
+flowchart TD
+  S["build_turn_context<br/>sanitize input · cached system prompt · turn-start compaction"] --> W
+  W{"api_call_count < max_iterations<br/>and budget left?"}
+  W -- yes --> BI["begin_iteration + prepare_iteration<br/>interrupt? budget?"]
+  BI --> AR["assemble_api_request<br/>messages → api_messages"]
+  AR --> PG{"run_preflight_gate<br/>too many tokens?"}
+  PG -- "yes: compress, retry iteration" --> W
+  PG -- no --> RL["_run_api_retry_loop<br/>guard → build_api_request → perform_api_call (stream) → check_api_response<br/>on error: handle_api_error → retry · fallback model · compress"]
+  RL --> N["normalize_model_response<br/>→ assistant_message"]
+  N --> T{"tool_calls?"}
+  T -- "yes" --> TR["run_tool_round<br/>validate · persist · execute · append results"]
+  TR -- "next iteration" --> W
+  T -- "no" --> FR["finish_text_response + stop gates"]
+  FR --> FIN
+  W -- "no (budget spent)" --> FIN
+  FIN["finalize_turn<br/>persist · usage · background review"] --> R(["return final_response + messages"])
+```
+
+How the phases are wired:
+- Each box is a **phase function** in its own `agent/turn_*.py` file.
+- The loop runs every phase through `_run_phase(fn, agent, state)`. `_run_phase` reads the phase's parameter names, passes in the matching fields of `_LoopState` (`messages`, `api_call_count`, `assistant_message` …), and copies the returned **verdict** fields back into the state.
+- Each verdict carries an `action`: `"continue"` (go to the next iteration), `"break"` (leave the loop and finalize) or `"return"` (end the turn now with `.result`).
+- This is why the loop body is short: it only routes on `.action`.
+
+Two counters stop runaway loops:
+- `agent.max_iterations`: how many API calls this agent may make.
+- `agent.iteration_budget`: a budget **shared with sub-agents**.
+
+When the budget runs out, the agent gets one "grace" call (`_budget_grace_call`) to write a final answer.
+
+---
+
+### 4A.4 One API call, in detail
+
+#### 4a. Building the request (`turn_request_assembly.py`, `turn_api_request.py`)
+1. `assemble_api_request` copies `messages` into `api_messages`. It adds the **cached system prompt**, which was built once by `agent/system_prompt.py` and never changes mid-session.
+2. `build_api_request` does three things:
+   - picks `tools_for_api`, the JSON schemas from `model_tools.get_tool_definitions(enabled_toolsets)`
+   - re-applies **prompt-cache markers** for the current provider (`_redecorate_prompt_cache_for_provider`, which uses `agent/prompt_caching.py`)
+   - lets the transport build provider kwargs
+
+#### 4b. Transports: how one loop talks to many vendors (`agent/transports/`)
+Every provider adapter implements `ProviderTransport` (`agent/transports/base.py`):
+```python
+class ProviderTransport(ABC):
+    def convert_messages(self, messages, **kw)   # OpenAI-style → vendor format
+    def convert_tools(self, tools)               # tool schemas → vendor format
+    def build_kwargs(...)                        # model, max_tokens, reasoning, cache...
+    def normalize_response(self, response, **kw) -> NormalizedResponse  # vendor → common shape
+    def map_finish_reason(self, raw)             # "end_turn"/"tool_use" → "stop"/"tool_calls"
+```
+- Inside the loop, every message uses **one common shape** (OpenAI chat style: `role`, `content`, `tool_calls`, `tool_call_id`). Conversion happens only at the edge.
+- `api_mode` picks the transport: `chat_completions` (OpenAI, OpenRouter, local servers), `anthropic_messages`, `codex_responses`, `bedrock_converse`. With `codex_app_server` the whole turn is handed to a subprocess and this loop is skipped.
+
+#### 4c. Sending (`turn_api_call.py::perform_api_call`)
+- **Streaming is preferred.** `_interruptible_streaming_api_call` sends each text delta to `agent.stream_delta_callback`. That callback drives the CLI display, the TUI, or the gateway's `stream_consumer.py`, which edits the chat message live.
+- Calls are **interruptible**. If the user hits stop or sends `/steer`, `InterruptedError` is raised and `handle_api_interrupt` keeps the partial text.
+- On an exception, `handle_api_error` (+ `turn_recovery*.py`, `turn_overflow.py`) classifies it:
+  - rate limit → back off and retry
+  - auth or billing → stop with guidance
+  - context too large (413/overflow) → compress, then retry
+  - provider down → switch to `fallback_model`
+
+  All of this stays inside `_run_api_retry_loop`.
+
+#### 4d. Reading the reply (`turn_response_check.py`, `turn_response_intake.py`)
+- `check_api_response` validates the shape.
+- `normalize_model_response` produces `s.assistant_message` with `.content`, `.tool_calls` and reasoning. Special cases:
+  - `finish_reason == "length"` → `turn_truncation.py` asks the model to continue and joins the parts
+  - empty or thinking-only reply → `turn_empty_response.py` nudges a retry
+
+---
+
+### 4A.5 Tool calls, in detail
+
+#### 5a. What a tool call looks like
+The model returns:
+```json
+{"role":"assistant","content":"Let me check.",
+ "tool_calls":[{"id":"call_1","type":"function",
+   "function":{"name":"terminal","arguments":"{\"command\":\"ls ~/Downloads\"}"}}]}
+```
+After the tool runs, the loop appends exactly one result per call:
+```json
+{"role":"tool","tool_call_id":"call_1","name":"terminal","content":"{\"output\":\"a.pdf\\nb.zip\",\"exit_code\":0}"}
+```
+On the next iteration the model sees that result and decides what to do next.
+
+#### 5b. `run_tool_round` (`agent/turn_tool_round.py:49`): the order matters
+1. **Validate** (`validate_tool_calls`): unknown tool names and bad JSON get an error result, so the model can correct itself.
+2. **Guardrails:**
+   - `expand_local_tool_batches`
+   - `_cap_delegate_task_calls` (limits sub-agent spawns)
+   - `_deduplicate_tool_calls` (drops identical repeats)
+3. **Stage + append** the assistant message to `messages`. Every emitted call keeps a matching result, and invalid ones get error results.
+4. **Persist before execute:** `_flush_messages_to_session_db` writes to `state.db` *before* any tool runs. If a destructive tool crashes or restarts Hermes, a resume can see what was being executed. If the save fails, the turn stops and **no tools run**.
+5. `agent._execute_tool_calls(...)` runs the calls (5c).
+6. If the context is getting large, compress after the tools. Then return `continue`, so the loop makes the next API call.
+
+```mermaid
+flowchart TD
+  A["assistant_message.tool_calls"] --> V["validate_tool_calls<br/>unknown name / bad JSON → error result"]
+  V --> G["guardrails<br/>cap delegate_task · dedupe"]
+  G --> AP["append assistant message"]
+  AP --> DB[("persist to state.db<br/>BEFORE any tool runs")]
+  DB --> PL{"more than one call?"}
+  PL -- no --> SQ["sequential"]
+  PL -- yes --> SEG["_plan_tool_batch_segments"]
+  SEG --> PAR["parallel segment<br/>read-only · distinct files<br/>up to 8 threads"]
+  SEG --> SQ2["sequential barrier<br/>side effects · clarify"]
+  SQ --> R["append role:tool results"]
+  PAR --> R
+  SQ2 --> R
+  R --> NX(["next API call"])
+```
+
+#### 5c. Sequential vs parallel (`run_agent.py:1299` → `agent/tool_executor.py`)
+```python
+if len(tool_calls) <= 1:
+    sequential
+else:
+    segments = _plan_tool_batch_segments(tool_calls, execution_cwd)
+    # e.g. [("parallel",[read_file a, read_file b, web_search]), ("sequential",[terminal]), ...]
+```
+- **Parallel-safe** calls are read-only, touch different files, or are MCP tools that opted in. They run in a thread pool of up to **8 workers** (`_MAX_TOOL_WORKERS`); image generation has its own lower cap.
+- Calls with side effects run as **sequential barriers**, in the order the model emitted them.
+- `clarify` and a few other interactive tools are `_NEVER_PARALLEL_TOOLS` (`agent/tool_dispatch_helpers.py:30`).
+- Approval prompts in parallel batches go through one `_ConcurrentToolAuthorizationGate`, so prompts never overlap on screen.
+- Before each sequential call the executor checks `_interrupt_requested`. If the user stopped the turn, the remaining calls get "cancelled" results.
+- Every tool has a timeout and an activity heartbeat. Large results are spilled to disk, and only a preview stays in context.
+
+#### 5d. Dispatching one call: three routes
+| Tool | Route |
+|---|---|
+| `memory`, `todo_list`, `session_search`, … (need agent state) | `agent/inline_tool_executors.py` (handled in-agent) |
+| `delegate_task` | `AIAgent._dispatch_delegate_task` → `tools/delegate_tool.py` (child AIAgent) |
+| everything else | `model_tools.handle_function_call(name, args, task_id, ...)` (`model_tools.py:873`) |
+
+The `handle_function_call` pipeline:
+```
+coerce args to schema types
+ → tool-search bridge (unwrap deferred tools)
+ → request middleware (plugins)
+ → _pre_dispatch_guards: approval for dangerous commands + pre_tool_call hooks (can block)
+ → registry.dispatch(name, args)  → handler in tools/<x>.py  (async handlers run via _run_async)
+ → post_tool_call hook + transform_tool_result hook
+ → always returns a JSON STRING (exceptions become {"error": "..."})
+```
+
+#### 5e. How tools get into the registry (`tools/registry.py`)
+```python
+# tools/web_tools.py — runs at import time
+registry.register(
+    name="web_search", toolset="web", schema=WEB_SEARCH_SCHEMA,
+    handler=lambda args, **kw: web_search_tool(args.get("query",""), limit=args.get("limit",5)),
+    check_fn=check_web_api_key,      # tool is hidden if this returns False (no API key)
+    requires_env=_web_requires_env(), emoji="🔍", max_result_size_chars=100_000,
+)
+```
+- `discover_builtin_tools()` scans `tools/*.py` for `registry.register(` calls in the syntax tree (cached on disk) and imports those modules.
+- Plugins add tools with `PluginContext.register_tool`, and MCP servers add theirs through `tools/mcp_tool*.py`.
+- `toolsets.py` decides which registered tools this agent may use. For example, `hermes-telegram` is a bundle of `web`, `terminal`, `file`, …
+
+---
+
+### 4A.6 Worked example: two iterations
+
+User: *"What's in my Downloads and how big is it?"*
+
+| # | Model sends back | Loop does |
+|---|---|---|
+| iter 1 | `tool_calls=[terminal("ls ~/Downloads"), terminal("du -sh ~/Downloads")]` | validate → append assistant msg → **persist** → plan segments. Both are side-effecting terminal calls, so they run sequentially → append 2 `role:tool` results → `continue` |
+| iter 2 | `content="You have 12 files (2.3 GB): ..."`, no tool calls | `finish_text_response` → stop gates pass → `break` |
+| end | — | `finalize_turn` saves to `state.db`, records token usage, may start a background memory/skill review. Returns `{"final_response": "You have 12 files…", "messages": [...]}` |
+
+That is **2 API calls** and **2 tool executions**: `api_call_count` = 2, and the shared iteration budget went down by 2.
+
+---
+
+### 4A.7 Cross-cutting rules the loop protects
+- **Prompt cache:** the system prompt is built once (`_cached_system_prompt`) and reused byte-for-byte every iteration. Memory written mid-turn shows up only in the *next* session. Only compression may rebuild it.
+- **Compression** (`agent/context_compressor.py`) runs at three points: turn start (`turn_context_compaction.py`), before each call (`run_preflight_gate`), and after tool results. It first prunes old tool outputs without an LLM call, then has an auxiliary model summarize the middle while keeping the head and tail. It creates a child session linked by `parent_session_id`.
+- **Durability:** the assistant/tool-call rows are saved to the DB before tools run, and results are saved as they complete. If a save fails, the turn ends instead of continuing from in-memory state.
+- **Interrupts / steer:** checked at each iteration start, during the API stream, and before each sequential tool.
+- **Sub-agents:** `delegate_task` builds a child `AIAgent` and runs this same loop with fewer tools and the shared budget. The parent gets only the summary.
 
 ---
 
